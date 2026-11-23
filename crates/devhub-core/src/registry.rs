@@ -146,6 +146,23 @@ pub const KNOWN: &[KnownDevice] = &[
         driver: DriverKind::Atk,
         verified: true,
     },
+    // ATK F1 Ultimate — ユーザー環境の列挙 373b:1031 (MI_00 Keyboard / MI_01 COL01-08 / MI_02 Mouse)。
+    // 12a7 と同じ MI_01 多 collection 構成なので ATK HUB 系 (ff02/u2・report-8/EEPROM) と仮定。
+    // **未検証**: ff02/u2 が無ければ registry に一致せず汎用ドライバ側に出る
+    // (その場合は「プロトコル解析: HID 構成を保存」のログで設定用 collection を確定する)。
+    KnownDevice {
+        vid: 0x373B,
+        pid: 0x1031,
+        usage_page: Some(0xFF02),
+        usage: Some(0x02),
+        kind: DeviceKind::Mouse,
+        vendor: "ATK",
+        model: "atk-f1u",
+        name: "ATK F1 Ultimate",
+        transport: Transport::Unknown,
+        driver: DriverKind::Atk,
+        verified: false,
+    },
     // ATK 8K ドングル "Wireless mouse 8k dongle-L" (373b:1278)。
     // 同じ 16B/report-8 プロトコルを中継 — 内側の機種は cmd16 CID/MID で確定。
     // マウス休眠中は中継コマンドがタイムアウトする (ドングル自身の cmd29 等は応答)。

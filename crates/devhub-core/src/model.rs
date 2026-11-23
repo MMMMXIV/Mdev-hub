@@ -72,6 +72,8 @@ pub enum DriverKind {
     Atk,
     /// www.lamzu.net / Aurora 系 (64B feature report、if2 FFFF:00)。
     Lamzu,
+    /// registry に無い任意の HID マウス/キーボード (検出 + プロトコル解析のみ、設定は書かない)。
+    Generic,
     /// 未割り当て (検出だけできる)。
     Unsupported,
 }

@@ -17,9 +17,14 @@ use std::sync::{Arc, Mutex};
 // mousefit 新プロトコル (64B feature report) ドライバ — 観測した全機種 (5219 有線・
 // 3854 ドングル) は Windows で feature report を持たないため現状どの機種にも振らない。
 // JS バンドル解析に基づく実装として残し、feature report を持つ機種が出たらここを使う。
+/// 未知デバイスのプロトコル解析 (汎用ドライバ・example `hidanalyze` 共通)。
+pub mod analyze;
 /// ATK 系ドライバ。診断 example (atkread) からも使うので公開。
 #[doc(hidden)]
 pub mod atk;
+mod generic;
+/// HID レポートディスクリプタの最小パーサ。
+pub mod hiddesc;
 #[doc(hidden)]
 pub mod lamzu;
 #[allow(dead_code)]
@@ -35,7 +40,8 @@ mod xsyd;
 pub fn connect() -> HubResult<Arc<dyn HubBackend>> {
     let api = transport::open()?;
     Ok(Arc::new(RealHub {
-        api: Mutex::new(api),
+        api: Arc::new(Mutex::new(api)),
+        generic: Mutex::new(HashMap::new()),
         paths: Mutex::new(HashMap::new()),
         drivers: Mutex::new(HashMap::new()),
         creating: Mutex::new(HashMap::new()),
@@ -53,12 +59,16 @@ fn driver_ready(kind: DriverKind) -> bool {
         DriverKind::Walkplay => true,
         DriverKind::Atk => true,
         DriverKind::Lamzu => true,
+        DriverKind::Generic => true,
         DriverKind::Unsupported => false,
     }
 }
 
 pub struct RealHub {
-    api: Mutex<hidapi::HidApi>,
+    /// 汎用ドライバが解析時に開き直すので共有する (hidapi は 1 プロセス 1 インスタンス)。
+    api: Arc<Mutex<hidapi::HidApi>>,
+    /// 汎用ドライバで扱う ID → scan 時点の DeviceInfo (registry に無いマウス/キーボード)。
+    generic: Mutex<HashMap<String, DeviceInfo>>,
     /// `DeviceId.0` → HID path (最後の scan 時点)。
     paths: Mutex<HashMap<String, CString>>,
     /// `DeviceId.0` → ドライバ (オープン済みは使い回す)。
@@ -89,12 +99,17 @@ impl HubBackend for RealHub {
         let mut names = self.names.lock().unwrap_or_else(|p| p.into_inner());
         let prev_paths = std::mem::take(&mut *paths);
         names.clear();
+        // registry に一致した VID:PID (汎用ドライバの対象から外す)。
+        let mut matched: Vec<(u16, u16)> = Vec::new();
         for d in api.device_list() {
             let Some(spec) =
                 registry::match_device(d.vendor_id(), d.product_id(), d.usage_page(), d.usage())
             else {
                 continue;
             };
+            if !matched.contains(&(spec.vid, spec.pid)) {
+                matched.push((spec.vid, spec.pid));
+            }
             let serial = d
                 .serial_number()
                 .filter(|s| !s.is_empty())
@@ -141,6 +156,66 @@ impl HubBackend for RealHub {
                 board_id: None,
             });
         }
+        // registry に無いマウス/キーボード → 汎用ドライバ (検出 + プロトコル解析)。
+        let mut generic = self.generic.lock().unwrap_or_else(|p| p.into_inner());
+        generic.clear();
+        for (vid, pid) in analyze::input_devices(&api) {
+            if matched.contains(&(vid, pid)) {
+                continue;
+            }
+            let ifs = analyze::interfaces(&api, vid, pid);
+            let Some(first) = ifs.first() else { continue };
+            let id = DeviceId(format!(
+                "hid:{vid:04x}:{pid:04x}:{}",
+                first
+                    .serial
+                    .clone()
+                    .unwrap_or_else(|| format!("{:08x}", fxhash(first.path.as_bytes())))
+            ));
+            // 汎用ドライバは開いたハンドルを持たないので、パスは先頭 collection を記録する
+            // (抜き差し検出 = キャッシュ破棄の判定に使う)。
+            paths.insert(id.0.clone(), first.path.clone());
+            let kind = match analyze::primary_kind(&ifs) {
+                Some(0x06) => DeviceKind::Keyboard,
+                Some(_) => DeviceKind::Mouse,
+                None => DeviceKind::Other,
+            };
+            let name = ifs
+                .iter()
+                .find_map(|i| i.product.clone())
+                .unwrap_or_else(|| format!("HID {vid:04X}:{pid:04X}"));
+            let lower = name.to_ascii_lowercase();
+            let transport = if ["dongle", "receiver", "wireless", "2.4g"]
+                .iter()
+                .any(|w| lower.contains(w))
+            {
+                Transport::Wireless24G
+            } else {
+                Transport::Unknown
+            };
+            let info = DeviceInfo {
+                id: id.clone(),
+                kind,
+                name: name.clone(),
+                vendor: first.manufacturer.clone().unwrap_or_else(|| "不明".into()),
+                model: "generic".into(),
+                vid,
+                pid,
+                transport,
+                firmware: None,
+                dongle_firmware: None,
+                serial: first.serial.clone(),
+                driver: DriverKind::Generic,
+                battery: None,
+                supported: true,
+                asleep: false,
+                board_id: None,
+            };
+            names.insert(id.0.clone(), name);
+            generic.insert(id.0.clone(), info.clone());
+            out.push(info);
+        }
+        drop(generic);
         // 抜かれた/差し直されたデバイスのキャッシュは死んだハンドル — パスが
         // 前回と一致するものだけ残し、他は捨てて次回 driver() で開き直す。
         self.drivers
@@ -179,6 +254,26 @@ impl HubBackend for RealHub {
             .get(&id.0)
         {
             return Ok(d.clone());
+        }
+        let generic_info = self
+            .generic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id.0)
+            .cloned();
+        if let Some(info) = generic_info {
+            let events = self
+                .watcher
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            let drv: Arc<dyn DeviceDriver> =
+                Arc::new(generic::open(self.api.clone(), info, events));
+            self.drivers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.0.clone(), drv.clone());
+            return Ok(drv);
         }
         let (vid, pid) = parse_id(id).ok_or_else(|| HubError::NotFound(id.clone()))?;
         let spec = known_spec(vid, pid).ok_or_else(|| HubError::NotFound(id.clone()))?;
@@ -287,7 +382,8 @@ impl RealHub {
             DriverKind::Walkplay => Arc::new(walkplay::open(dev, info)?),
             DriverKind::Atk => Arc::new(atk::open(dev, info, events)?),
             DriverKind::Lamzu => Arc::new(lamzu::open(dev, info, events)?),
-            DriverKind::Unsupported => {
+            // 汎用ドライバは driver() 側で registry を経由せずに作る。
+            DriverKind::Generic | DriverKind::Unsupported => {
                 return Err(HubError::NotImplemented("このデバイスのドライバ"))
             }
         };

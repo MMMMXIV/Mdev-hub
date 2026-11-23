@@ -41,6 +41,12 @@ with a Liquid Glass design.
 Other models using the same protocols (mouse.fit report-8/EEPROM, xsyd) are
 detected automatically by capability, not by device name.
 
+**Any other HID mouse / keyboard** is picked up by the generic driver: it shows
+up in the sidebar under its product name, and the "General" tab can save a
+read-only protocol analysis log (HID collections, report descriptors, vendor
+feature reports, live input-report diffs). The same is available from the CLI:
+`cargo run -p devhub-hid --example hidanalyze`. See `docs/ADD_DEVICE.md` §2.5.
+
 ## Requirements
 
 - Windows 10/11 (x64)
@@ -138,6 +144,10 @@ UI は GPUI + Liquid Glass デザイン。
 
 HTS Plus Pro (有線+ドングル) · SU66 Max · TP55 USB DAC
 (同プロトコルの他機種も caps ベースで自動検出)
+
+上記以外の HID マウス / キーボードも**汎用ドライバで自動検出**し、「一般」タブから
+プロトコル解析ログ (構成・ディスクリプタ・Feature 読み出し・受信レポートの差分) を保存できます
+(読み取りのみ)。CLI: `cargo run -p devhub-hid --example hidanalyze` — 詳細は `docs/ADD_DEVICE.md` §2.5。
 
 ### ビルド
 

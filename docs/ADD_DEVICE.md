@@ -14,7 +14,10 @@
 | HTS Plus Pro (無線) | ドングル 33E4:3854 | FF02 / 02 | Mousefit → `mousefit8.rs` (report-8/EEPROM) | www.mouse.fit | **v2 実機検証済** (全設定・DPI・ボタン・マクロ・ポーリング 125–8K・磁気ボタン校正/押下深さ・休眠検知/覚醒自動再読) |
 | HTS Plus Pro (有線) | 33E4:5219 | FF02 / 02 | Mousefit → `mousefit8.rs` (report-8/EEPROM) | www.mouse.fit | **v2 実機検証済** (有線でも feature report は使えず report-8) |
 | HTX Ultra | 33E4:5608, 5617, 5618, 5619 | FF02 / 02 (推定) | Mousefit | www.mouse.fit | 機種表から登録 / 未検証 |
-| ATK F1 Ultimate | 未確定 | 未確定 | 未確定 | (mouse.fit の機種表に無い) | §7 を参照 |
+| ATK F1 Ultimate | 373B:1031 | FF02 / 02 (仮定) | Atk (`atk.rs`) | ATK HUB | registry 登録済み / **未検証** (MI_01 COL01-08 構成は 12a7 と同型) |
+| REDRAGON IMPACT (M908) | 04D9:FC4D | MI_02 COL02 vendor | Generic (`generic.rs`) | 公式 Windows ソフト | 汎用ドライバで検出・解析のみ |
+| HM66 (キーボード) | 3553:B001 か C019:1234 (要確認) | — | Generic (`generic.rs`) | — | 汎用ドライバで検出・解析のみ |
+| **上記以外の HID マウス / キーボード** | 任意 | — | Generic (`generic.rs`) | — | 自動で検出 → 「一般」タブで解析ログを保存 (§2.5) |
 
 **接続方式でプロトコルが変わる点に注意**: mouse.fit の新プロトコル (64B feature report) は
 有線機種専用 — 8K ドングルは Windows の feature report を一切持たず、ドングル経由は
@@ -108,6 +111,35 @@ configurator の JS より先に、次のスニペットを Console に貼って
 
 **1 項目だけ変えて送信の差分を見る** のが最速 (例: DPI を 800 → 1600 に変えて、どのバイトが変わるか)。
 USBPcap + Wireshark でも取れるが、WebHID のフックの方が速い。
+
+### 2.5 汎用ドライバ / hidanalyze で解析する (Web 版が無い機種)
+
+registry に無いマウス・キーボードは**自動で汎用ドライバ (`DriverKind::Generic`) に割り当たり**、
+サイドバーに製品名で出る。設定は書かないが、「一般」タブに次の 2 つの操作が出る
+(どちらも**読み取りのみ** — GET_FEATURE と Input の受信だけで、デバイスへは書き込まない):
+
+| 操作 | 中身 |
+|---|---|
+| プロトコル解析: HID 構成を保存 | 全 collection の usage・レポートディスクリプタ (生 + report ID ごとの長さ)・vendor collection の Feature report 読み出し |
+| プロトコル解析: 受信レポートを 20 秒記録 | 開ける collection の Input report を記録し、直前との**変化バイト位置**を出す |
+
+同じことを CLI でもできる:
+
+```bash
+cargo run -p devhub-hid --example hidanalyze                       # マウス/キーボード一覧
+cargo run -p devhub-hid --example hidanalyze -- 04d9:fc4d > a.txt   # 構成 + ディスクリプタ + Feature
+cargo run -p devhub-hid --example hidanalyze -- 04d9:fc4d --sniff 30
+```
+
+読み方:
+- `Vendor-defined (設定用の候補)` の collection が設定チャネル。その Output / Feature の
+  `wire=` がフレーム長 (report ID 込み) になる。
+- Windows では Mouse / Keyboard collection は OS が排他で握るので「open 失敗」と出る (正常)。
+- **公式ソフト (Windows exe) が送るフレーム** (SET_REPORT / interrupt OUT) は HID API からは
+  見えない。USBPcap + Wireshark で `usb.idVendor == 0x04d9` などで絞り、
+  1 項目だけ変えて送信の差分を見る (§2.3 と同じ考え方)。
+  受信側の変化 (sniff) と送信側 (USBPcap) を突き合わせると、フィールド位置が確定する。
+- 解析が済んだら §3 で registry に専用ドライバとして登録する。そうすると汎用ドライバの対象から自動で外れる。
 
 ### 2.4 フィクスチャとして保存
 
