@@ -4,6 +4,9 @@
 //! 1. ff02/u2 collection を探す (有線 / ドングル問わず)
 //! 2. cmd16 (CID/MID 問い合わせ) の生応答を出す — 新機種を atk.rs の機種表に足す材料
 //! 3. ドライバ経路 (atk::open → info → caps → read) で全設定を読み、表示する
+//!
+//! `--dpi-test` を付けたときだけ DPI の書き込み往復を行う:
+//! 1 段目を +10 して書く → 読み戻して一致を確認 → 元の値に戻す → 読み戻して確認。
 
 use devhub_core::backend::DeviceDriver;
 use devhub_core::model::*;
@@ -135,5 +138,48 @@ fn main() {
             Err(e) => println!("== EEPROM {what}: {e}"),
         }
     }
+    if std::env::args().any(|a| a == "--dpi-test") {
+        dpi_test(&d, &s);
+        return;
+    }
     println!("== 完了 (書き込みはしていません)");
+}
+
+/// DPI 書き込み往復 (`--dpi-test` のときだけ)。最後に必ず元の値へ戻す。
+fn dpi_test(d: &atk::AtkDriver, before: &DeviceState) {
+    let Some(ms) = &before.mouse else {
+        println!("== dpi-test: mouse state なし");
+        return;
+    };
+    let orig = ms.stages.clone();
+    let mut test = orig.clone();
+    let step = d.caps().mouse.map(|m| m.dpi_step).unwrap_or(10);
+    test[0].x += step;
+    test[0].y = test[0].y.map(|y| y + step);
+    println!("== dpi-test: 1 段目 {} → {} を書き込みます", orig[0].x, test[0].x);
+    let write = |stages: &Vec<DpiStage>| {
+        d.apply(&Change::DpiStages {
+            stages: stages.clone(),
+            active: ms.active_stage,
+        })
+    };
+    if let Err(e) = write(&test) {
+        println!("== dpi-test: 書き込み失敗: {e} (何も変わっていません)");
+        return;
+    }
+    let got = d.read().ok().and_then(|s| s.mouse).map(|m| m.stages[0].x);
+    println!(
+        "== dpi-test: 読み戻し = {got:?} → {}",
+        if got == Some(test[0].x) { "一致 OK" } else { "不一致 NG" }
+    );
+    match write(&orig) {
+        Ok(()) => {
+            let back = d.read().ok().and_then(|s| s.mouse).map(|m| m.stages[0].x);
+            println!(
+                "== dpi-test: 元に戻しました = {back:?} → {}",
+                if back == Some(orig[0].x) { "OK" } else { "NG (公式ソフトで確認してください)" }
+            );
+        }
+        Err(e) => println!("== dpi-test: 復元失敗: {e} — 公式ソフトで DPI を {} に戻してください", orig[0].x),
+    }
 }

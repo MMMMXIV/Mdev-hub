@@ -301,15 +301,44 @@ impl AtkDriver {
         (x, y)
     }
 
-    /// 旧式 DPI レコード (4B): [x, y, ex, crc]、dpi = (raw + 1) * 50。
-    /// F1 V3 実機の @12/@20 = [7,7,0,71]/[31,31,0,23] が 400/1600 (= 3955 側の 1・3 段目) と
-    /// 一致することから導いた式。ex の上位ビット (x: bit2-3, y: bit6-7) は 3955 と同じ並びと
-    /// **仮定** (12800 dpi 超で効く。未検証 — 書き込みには使わない)。
-    fn parse_legacy_stage(b: &[u8]) -> (u32, u32) {
+    /// 旧式 DPI レコード (4B): [x, y, ex, crc]、dpi = (raw10 + 1) * unit。
+    /// raw10 = 下位 8bit + ex の 2bit (x: bit2-3, y: bit6-7)。crc = 0x55 - sum(3B)。
+    /// F1 Ultimate (CID 2, FW 3.1) 実機: `9f 9f 00 17` = 1600、`3f 3f 44 93` = 3200
+    /// (unit=10。公式設定 1600 / 10 刻みと一致)。
+    fn parse_legacy_stage(b: &[u8], unit: u32) -> (u32, u32) {
         let ex = b[2] as u32;
         let x = b[0] as u32 | (((ex >> 2) & 3) << 8);
         let y = b[1] as u32 | (((ex >> 6) & 3) << 8);
-        ((x + 1) * 50, (y + 1) * 50)
+        ((x + 1) * unit, (y + 1) * unit)
+    }
+
+    /// `parse_legacy_stage` の逆。範囲外は Invalid。
+    fn encode_legacy_stage(x: u32, y: u32, unit: u32) -> HubResult<Vec<u8>> {
+        let max = 1024 * unit;
+        for v in [x, y] {
+            if v < unit || v > max || v % unit != 0 {
+                return Err(HubError::Invalid(format!(
+                    "DPI {v} (この機種は {unit}〜{max}、{unit} 刻み)"
+                )));
+            }
+        }
+        let (rx, ry) = (x / unit - 1, y / unit - 1);
+        let mut b = vec![
+            (rx & 0xff) as u8,
+            (ry & 0xff) as u8,
+            ((((rx >> 8) & 3) << 2) | (((ry >> 8) & 3) << 6)) as u8,
+            0,
+        ];
+        b[3] = Self::crc(&b);
+        Ok(b)
+    }
+
+    /// 旧式 DPI レコードの単位 (実機確認済みの機種だけ Some)。
+    fn legacy_unit(&self) -> Option<u32> {
+        match *self.cidmid.lock().unwrap_or_else(|p| p.into_inner()) {
+            Some((2, 42)) => Some(10),
+            _ => None,
+        }
     }
 
     /// EEPROM の生読み出し (診断 example `atkcheck --dump` 用。書き込みはしない)。
@@ -627,7 +656,14 @@ impl DeviceDriver for AtkDriver {
     }
 
     fn caps(&self) -> Capabilities {
-        self.caps.clone()
+        let mut c = self.caps.clone();
+        // 旧式 DPI レコードの機種は範囲と刻みが違う (10 bit × unit)。
+        if let (Some(u), Some(m)) = (self.legacy_unit(), c.mouse.as_mut()) {
+            m.dpi_min = u;
+            m.dpi_max = 1024 * u;
+            m.dpi_step = u;
+        }
+        c
     }
 
     fn read(&self) -> HubResult<DeviceState> {
@@ -647,7 +683,10 @@ impl DeviceDriver for AtkDriver {
         let mut stages = vec![];
         for i in 0..stage_n {
             let (x, y) = if legacy {
-                Self::parse_legacy_stage(&stages_raw[i * 4..i * 4 + 4])
+                Self::parse_legacy_stage(
+                    &stages_raw[i * 4..i * 4 + 4],
+                    self.legacy_unit().unwrap_or(10),
+                )
             } else {
                 Self::parse_stage(&stages_raw[i * 6..i * 6 + 6])
             };
@@ -772,19 +811,30 @@ impl DeviceDriver for AtkDriver {
             },
             Change::DpiStages { stages, active } => {
                 // 方式が未確定の機種に 3955 レコードを書くと別領域を壊しうる — 止める。
-                if !self.dpi_3955() {
-                    return Err(HubError::Unsupported(
+                let legacy = if self.dpi_3955() {
+                    None
+                } else {
+                    Some(self.legacy_unit().ok_or(HubError::Unsupported(
                         "この機種の DPI 書き込み (EEPROM 配置が未検証)",
-                    ));
-                }
+                    ))?)
+                };
                 let n = stages.len().clamp(1, 8);
+                // 先に全段をエンコードして範囲を検査する (途中まで書いて失敗しないように)。
+                let recs: Vec<Vec<u8>> = stages[..n]
+                    .iter()
+                    .map(|s| match legacy {
+                        Some(u) => Self::encode_legacy_stage(s.x, s.y.unwrap_or(s.x), u),
+                        None => Ok(Self::encode_stage(s.x, s.y.unwrap_or(s.x))),
+                    })
+                    .collect::<HubResult<_>>()?;
                 self.ee_write_val(ee::MAX_DPI_STAGE, n as u8)?;
                 self.ee_write_val(ee::CURRENT_DPI, (*active).min(n - 1) as u8)?;
                 for (i, s) in stages[..n].iter().enumerate() {
-                    self.ee_write(
-                        ee::DPI_3955 + (i * 6) as u16,
-                        &Self::encode_stage(s.x, s.y.unwrap_or(s.x)),
-                    )?;
+                    let addr = match legacy {
+                        Some(_) => ee::DPI_LEGACY + (i * 4) as u16,
+                        None => ee::DPI_3955 + (i * 6) as u16,
+                    };
+                    self.ee_write(addr, &recs[i])?;
                     let mut c = vec![s.color.r, s.color.g, s.color.b, 0];
                     c[3] = Self::crc(&c);
                     self.ee_write(ee::DPI_COLOR + (i * 4) as u16, &c)?;
@@ -836,10 +886,29 @@ mod tests {
     use super::AtkDriver;
 
     #[test]
-    fn legacy_stage_matches_f1v3_dump() {
+    fn legacy_stage_matches_f1u_dump() {
         // F1 V3 実機 @12 / @20 (3955 側の 1・3 段目 = 400 / 1600 と一致)。
-        assert_eq!(AtkDriver::parse_legacy_stage(&[7, 7, 0, 71]), (400, 400));
-        assert_eq!(AtkDriver::parse_legacy_stage(&[31, 31, 0, 23]), (1600, 1600));
+        // F1 Ultimate (CID 2) 実機 @12 / @24 — 公式表示 1600 と既定 3200。
+        assert_eq!(AtkDriver::parse_legacy_stage(&[0x9f, 0x9f, 0x00, 0x17], 10), (1600, 1600));
+        assert_eq!(AtkDriver::parse_legacy_stage(&[0x3f, 0x3f, 0x44, 0x93], 10), (3200, 3200));
+    }
+
+    #[test]
+    fn legacy_stage_roundtrip() {
+        assert_eq!(
+            AtkDriver::encode_legacy_stage(1600, 1600, 10).unwrap(),
+            vec![0x9f, 0x9f, 0x00, 0x17]
+        );
+        assert_eq!(
+            AtkDriver::encode_legacy_stage(3200, 3200, 10).unwrap(),
+            vec![0x3f, 0x3f, 0x44, 0x93]
+        );
+        for dpi in [10, 400, 2560, 2570, 10240] {
+            let b = AtkDriver::encode_legacy_stage(dpi, dpi, 10).unwrap();
+            assert_eq!(AtkDriver::parse_legacy_stage(&b, 10), (dpi, dpi));
+        }
+        assert!(AtkDriver::encode_legacy_stage(1605, 1605, 10).is_err());
+        assert!(AtkDriver::encode_legacy_stage(10250, 10250, 10).is_err());
     }
 
     #[test]
