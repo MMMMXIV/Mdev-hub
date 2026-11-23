@@ -146,10 +146,10 @@ pub const KNOWN: &[KnownDevice] = &[
         driver: DriverKind::Atk,
         verified: true,
     },
-    // ATK F1 Ultimate — ユーザー環境の列挙 373b:1031 (MI_00 Keyboard / MI_01 COL01-08 / MI_02 Mouse)。
-    // 12a7 と同じ MI_01 多 collection 構成なので ATK HUB 系 (ff02/u2・report-8/EEPROM) と仮定。
-    // **未検証**: ff02/u2 が無ければ registry に一致せず汎用ドライバ側に出る
-    // (その場合は「プロトコル解析: HID 構成を保存」のログで設定用 collection を確定する)。
+    // ATK F1 Ultimate 8K ドングル — 実機列挙 373b:1031 "ATK F1 Ultimate Mouse 8K Dongle" (Compx)。
+    // hidanalyze で確認: MI_01 COL05 = ff02/u2、report 8 の 17B in/out (1278/12a7 と同形)。
+    // 内側機種は cmd16 CID/MID で確定 — F1 Ultimate の CID/MID は未登録 (atkcheck で採取)。
+    // **未検証**: EEPROM 配置を F1 V3 ULTIMATE+ と同じと仮定している。
     KnownDevice {
         vid: 0x373B,
         pid: 0x1031,
@@ -157,9 +157,9 @@ pub const KNOWN: &[KnownDevice] = &[
         usage: Some(0x02),
         kind: DeviceKind::Mouse,
         vendor: "ATK",
-        model: "atk-f1u",
+        model: "atk-f1u-dongle",
         name: "ATK F1 Ultimate",
-        transport: Transport::Unknown,
+        transport: Transport::Wireless24G,
         driver: DriverKind::Atk,
         verified: false,
     },

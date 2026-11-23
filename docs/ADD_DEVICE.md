@@ -14,9 +14,9 @@
 | HTS Plus Pro (無線) | ドングル 33E4:3854 | FF02 / 02 | Mousefit → `mousefit8.rs` (report-8/EEPROM) | www.mouse.fit | **v2 実機検証済** (全設定・DPI・ボタン・マクロ・ポーリング 125–8K・磁気ボタン校正/押下深さ・休眠検知/覚醒自動再読) |
 | HTS Plus Pro (有線) | 33E4:5219 | FF02 / 02 | Mousefit → `mousefit8.rs` (report-8/EEPROM) | www.mouse.fit | **v2 実機検証済** (有線でも feature report は使えず report-8) |
 | HTX Ultra | 33E4:5608, 5617, 5618, 5619 | FF02 / 02 (推定) | Mousefit | www.mouse.fit | 機種表から登録 / 未検証 |
-| ATK F1 Ultimate | 373B:1031 | FF02 / 02 (仮定) | Atk (`atk.rs`) | ATK HUB | registry 登録済み / **未検証** (MI_01 COL01-08 構成は 12a7 と同型) |
-| REDRAGON IMPACT (M908) | 04D9:FC4D | MI_02 COL02 vendor | Generic (`generic.rs`) | 公式 Windows ソフト | 汎用ドライバで検出・解析のみ |
-| HM66 (キーボード) | 3553:B001 か C019:1234 (要確認) | — | Generic (`generic.rs`) | — | 汎用ドライバで検出・解析のみ |
+| ATK F1 Ultimate (8K ドングル) | 373B:1031 | FF02 / 02 (hidanalyze で確認) | Atk (`atk.rs`) | ATK HUB | registry 登録済み / **未検証** (report 8・17B は 1278 と同形。CID/MID は `atkcheck` で採取) |
+| REDRAGON IMPACT (M908) | 04D9:FC4D | MI_02 FFA0 / 01 (Feature 2-6: 16/64/256/1024/2048B、Input 7/8: 8B) | Generic (`generic.rs`) | 公式 Windows ソフト | 汎用ドライバで検出・解析のみ。公式ソフトの送信を USBPcap で要採取 |
+| HM66 (キーボード) | 未確定 (3553:B001 は PCsensor FootSwitch。C019:1234 は vendor collection なし) | — | Generic (`generic.rs`) | — | 接続方式を確認中 |
 | **上記以外の HID マウス / キーボード** | 任意 | — | Generic (`generic.rs`) | — | 自動で検出 → 「一般」タブで解析ログを保存 (§2.5) |
 
 **接続方式でプロトコルが変わる点に注意**: mouse.fit の新プロトコル (64B feature report) は
