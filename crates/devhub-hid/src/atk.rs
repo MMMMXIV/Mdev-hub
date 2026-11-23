@@ -37,6 +37,8 @@ mod ee {
     pub const CURRENT_DPI: u16 = 4;
     pub const LOD: u16 = 10;
     pub const DPI_COLOR: u16 = 44;
+    /// 旧式 DPI レコード (4B × 8) — PAW3955 以外 (CID=2 系) はこちらと思われる。
+    pub const DPI_LEGACY: u16 = 12;
     pub const KEY_FUNCTION: u16 = 96;
     pub const DEBOUNCE: u16 = 169;
     pub const MOTION_SYNC: u16 = 171;
@@ -57,6 +59,8 @@ mod ee {
 fn mid_name(cid: u8, mid: u8) -> Option<(&'static str, &'static str)> {
     match (cid, mid) {
         (1, 62) => Some(("ATK F1 V3 ULTIMATE+", "atk-f1v3u")),
+        // 実機 (373b:1031 ドングル経由, FW 3.1) の cmd16 応答 `.. 02 2a ..`。
+        (2, 42) => Some(("ATK F1 Ultimate", "atk-f1u")),
         _ => None,
     }
 }
@@ -70,6 +74,8 @@ pub struct AtkDriver {
     events: Option<std::sync::Arc<dyn Fn(HubEvent) + Send + Sync>>,
     /// CID/MID で機種確定済みか (ドングル経由で休眠中は未確定のまま)。
     detected: Mutex<bool>,
+    /// cmd16 で取れた (CID, MID)。
+    cidmid: Mutex<Option<(u8, u8)>>,
 }
 
 pub fn open(
@@ -84,6 +90,7 @@ pub fn open(
         caps: build_caps(),
         events,
         detected: Mutex::new(false),
+        cidmid: Mutex::new(None),
     };
     // CID/MID で機種確定 (応答があれば名を差し替える)。
     d.maybe_detect();
@@ -115,6 +122,7 @@ impl AtkDriver {
             return;
         }
         *self.detected.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        *self.cidmid.lock().unwrap_or_else(|p| p.into_inner()) = Some((cid, mid));
         let mut i = self.info.lock().unwrap_or_else(|p| p.into_inner());
         let mut dirty = false;
         if let Some((name, model)) = mid_name(cid, mid) {
@@ -129,6 +137,15 @@ impl AtkDriver {
             drop(i);
             self.emit_info(info);
         }
+    }
+
+    /// DPI が PAW3955 レコード (@6912) 方式か。実機確認済みは CID=1 系 (F1 V3 ULTIMATE+) のみ。
+    /// CID=2 系 (F1 Ultimate 等) は @6912 が未使用 (0xff) で、旧式レコードと思われるが未確定。
+    fn dpi_3955(&self) -> bool {
+        matches!(
+            *self.cidmid.lock().unwrap_or_else(|p| p.into_inner()),
+            Some((1, _))
+        )
     }
 
     /// 休眠フラグの更新 (ドングル経由のみ意味を持つ)。
@@ -282,6 +299,23 @@ impl AtkDriver {
             y *= 2;
         }
         (x, y)
+    }
+
+    /// 旧式 DPI レコード (4B): [x, y, ex, crc]、dpi = (raw + 1) * 50。
+    /// F1 V3 実機の @12/@20 = [7,7,0,71]/[31,31,0,23] が 400/1600 (= 3955 側の 1・3 段目) と
+    /// 一致することから導いた式。ex の上位ビット (x: bit2-3, y: bit6-7) は 3955 と同じ並びと
+    /// **仮定** (12800 dpi 超で効く。未検証 — 書き込みには使わない)。
+    fn parse_legacy_stage(b: &[u8]) -> (u32, u32) {
+        let ex = b[2] as u32;
+        let x = b[0] as u32 | (((ex >> 2) & 3) << 8);
+        let y = b[1] as u32 | (((ex >> 6) & 3) << 8);
+        ((x + 1) * 50, (y + 1) * 50)
+    }
+
+    /// EEPROM の生読み出し (診断 example `atkcheck --dump` 用。書き込みはしない)。
+    #[doc(hidden)]
+    pub fn ee_dump(&self, addr: u16, len: u16) -> HubResult<Vec<u8>> {
+        self.ee_read(addr, len)
     }
 
     fn encode_stage(x: u32, y: u32) -> Vec<u8> {
@@ -603,12 +637,20 @@ impl DeviceDriver for AtkDriver {
         let rate_code = blk[0];
         let stage_n = (blk[2] as usize).clamp(1, 8);
         let active = (blk[4] as usize).min(stage_n - 1);
-        let stages_raw = self.ee_read(ee::DPI_3955, (stage_n * 6) as u16)?;
+        let legacy = !self.dpi_3955();
+        let stages_raw = if legacy {
+            self.ee_read(ee::DPI_LEGACY, (stage_n * 4) as u16)?
+        } else {
+            self.ee_read(ee::DPI_3955, (stage_n * 6) as u16)?
+        };
         let colors = self.ee_read(ee::DPI_COLOR, (stage_n * 4) as u16)?;
         let mut stages = vec![];
         for i in 0..stage_n {
-            let rec = &stages_raw[i * 6..i * 6 + 6];
-            let (x, y) = Self::parse_stage(rec);
+            let (x, y) = if legacy {
+                Self::parse_legacy_stage(&stages_raw[i * 4..i * 4 + 4])
+            } else {
+                Self::parse_stage(&stages_raw[i * 6..i * 6 + 6])
+            };
             let c = &colors[i * 4..i * 4 + 4];
             stages.push(DpiStage {
                 x,
@@ -729,6 +771,12 @@ impl DeviceDriver for AtkDriver {
                 _ => Err(HubError::Unsupported("setting")),
             },
             Change::DpiStages { stages, active } => {
+                // 方式が未確定の機種に 3955 レコードを書くと別領域を壊しうる — 止める。
+                if !self.dpi_3955() {
+                    return Err(HubError::Unsupported(
+                        "この機種の DPI 書き込み (EEPROM 配置が未検証)",
+                    ));
+                }
                 let n = stages.len().clamp(1, 8);
                 self.ee_write_val(ee::MAX_DPI_STAGE, n as u8)?;
                 self.ee_write_val(ee::CURRENT_DPI, (*active).min(n - 1) as u8)?;
@@ -780,5 +828,24 @@ impl DeviceDriver for AtkDriver {
             percent: Some(r.get(6).copied().unwrap_or(0).min(100)),
             charging: r.get(7).copied().unwrap_or(0) != 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AtkDriver;
+
+    #[test]
+    fn legacy_stage_matches_f1v3_dump() {
+        // F1 V3 実機 @12 / @20 (3955 側の 1・3 段目 = 400 / 1600 と一致)。
+        assert_eq!(AtkDriver::parse_legacy_stage(&[7, 7, 0, 71]), (400, 400));
+        assert_eq!(AtkDriver::parse_legacy_stage(&[31, 31, 0, 23]), (1600, 1600));
+    }
+
+    #[test]
+    fn unused_3955_region_decodes_to_garbage() {
+        // F1 Ultimate (CID=2) で観測した 524288 は @6912 が 0xff 埋めのときの値。
+        let (x, _) = AtkDriver::parse_stage(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(x, 524288);
     }
 }

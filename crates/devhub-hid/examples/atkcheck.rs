@@ -118,5 +118,22 @@ fn main() {
     for (k, v) in &s.settings {
         println!("   {k} = {v:?}");
     }
+    // ---- EEPROM 生ダンプ (DPI 方式の確定用)
+    for (addr, len, what) in [
+        (0u16, 100u16, "@0 rate/stage/LOD/旧式DPI/色"),
+        (96, 64, "@96 ボタン割当"),
+        (160, 80, "@160 各種設定"),
+        (6912, 60, "@6912 PAW3955 DPI"),
+    ] {
+        match d.ee_dump(addr, len) {
+            Ok(b) => {
+                println!("== EEPROM {what}");
+                for (k, ch) in b.chunks(10).enumerate() {
+                    println!("   {:>5}: {}", addr as usize + k * 10, hiddesc::hex(ch));
+                }
+            }
+            Err(e) => println!("== EEPROM {what}: {e}"),
+        }
+    }
     println!("== 完了 (書き込みはしていません)");
 }
